@@ -29,6 +29,7 @@ def chatglm_generate_stream(
     echo = params.get("echo", True)
 
     gen_kwargs = {
+        "max_length": 10000,
         # "max_new_tokens": max_new_tokens,  disabled due to a warning.
         "do_sample": True if temperature > 1e-5 else False,
         "top_p": top_p,
