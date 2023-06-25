@@ -30,6 +30,9 @@ from transformers.generation.logits_process import (
 from fastchat.conversation import get_conv_template, SeparatorStyle
 from fastchat.model.model_adapter import load_model, get_conversation_template
 from fastchat.model.chatglm_model import chatglm_generate_stream
+from fastchat.model.falcon_model import falcon_generate_stream
+from fastchat.modules.gptq import GptqConfig
+from fastchat.utils import is_partial_stop
 
 
 def prepare_logits_processor(
@@ -46,13 +49,6 @@ def prepare_logits_processor(
     if top_k > 0:
         processor_list.append(TopKLogitsWarper(top_k))
     return processor_list
-
-
-def partial_stop(output, stop_str):
-    for i in range(0, min(len(output), len(stop_str))):
-        if stop_str.startswith(output[-i:]):
-            return True
-    return False
 
 
 @torch.inference_mode()
@@ -76,7 +72,6 @@ def generate_stream(
     )
 
     input_ids = tokenizer(prompt).input_ids
-    input_echo_len = len(input_ids)
     output_ids = list(input_ids)
 
     if model.config.is_encoder_decoder:
@@ -85,6 +80,7 @@ def generate_stream(
         max_src_len = context_len - max_new_tokens - 8
 
     input_ids = input_ids[-max_src_len:]
+    input_echo_len = len(input_ids)
 
     if model.config.is_encoder_decoder:
         encoder_output = model.encoder(
@@ -177,7 +173,7 @@ def generate_stream(
                         output = output[:pos]
                         stopped = True
                     else:
-                        partially_stopped = partial_stop(output, stop_str)
+                        partially_stopped = is_partial_stop(output, stop_str)
                 elif isinstance(stop_str, Iterable):
                     for each_stop in stop_str:
                         pos = output.rfind(each_stop, rfind_start)
@@ -186,7 +182,7 @@ def generate_stream(
                             stopped = True
                             break
                         else:
-                            partially_stopped = partial_stop(output, each_stop)
+                            partially_stopped = is_partial_stop(output, each_stop)
                             if partially_stopped:
                                 break
                 else:
@@ -257,33 +253,54 @@ def chat_loop(
     repetition_penalty: float,
     max_new_tokens: int,
     chatio: ChatIO,
+    gptq_config: GptqConfig,
+    revision: str,
     debug: bool,
 ):
     # Model
     model, tokenizer = load_model(
-        model_path, device, num_gpus, max_gpu_memory, load_8bit, cpu_offloading, debug
+        model_path,
+        device,
+        num_gpus,
+        max_gpu_memory,
+        load_8bit,
+        cpu_offloading,
+        gptq_config,
+        revision,
+        debug,
     )
     is_chatglm = "chatglm" in str(type(model)).lower()
-    is_fastchat_t5 = "t5" in str(type(model)).lower()
+    is_t5 = "t5" in str(type(model)).lower()
+    is_falcon = "rwforcausallm" in str(type(model)).lower()
 
-    # Hardcode T5 repetition penalty to be 1.2
-    if is_fastchat_t5 and repetition_penalty == 1.0:
+    # Hardcode T5's default repetition penalty to be 1.2
+    if is_t5 and repetition_penalty == 1.0:
         repetition_penalty = 1.2
 
     # Chat
-    if conv_template:
-        conv = get_conv_template(conv_template)
-    else:
-        conv = get_conversation_template(model_path)
+    def new_chat():
+        if conv_template:
+            conv = get_conv_template(conv_template)
+        else:
+            conv = get_conversation_template(model_path)
+        return conv
+
+    conv = new_chat()
 
     while True:
         try:
             inp = chatio.prompt_for_input(conv.roles[0])
         except EOFError:
             inp = ""
-        if not inp:
+
+        if inp == "!!exit" or not inp:
             print("exit...")
             break
+
+        if inp == "!!reset":
+            print("resetting...")
+            conv = new_chat()
+            continue
 
         conv.append_message(conv.roles[0], inp)
         conv.append_message(conv.roles[1], None)
@@ -291,6 +308,9 @@ def chat_loop(
         if is_chatglm:
             generate_stream_func = chatglm_generate_stream
             prompt = conv.messages[conv.offset :]
+        elif is_falcon:
+            generate_stream_func = falcon_generate_stream
+            prompt = conv.get_prompt()
         else:
             generate_stream_func = generate_stream
             prompt = conv.get_prompt()
@@ -310,10 +330,15 @@ def chat_loop(
         output_stream = generate_stream_func(model, tokenizer, gen_params, device)
         t = time.time()
         outputs = chatio.stream_output(output_stream)
-        t = time.time() - t
+        duration = time.time() - t
         conv.update_last_message(outputs.strip())
 
         if debug:
-            print("\n", {"prompt": prompt, "outputs": outputs}, "\n")
             num_tokens = len(tokenizer.encode(outputs))
-            print(f"Tokens per second: {num_tokens / t:.2f}\n")
+            msg = {
+                "conv_template": conv.name,
+                "prompt": prompt,
+                "outputs": outputs,
+                "speed (token/s)": round(num_tokens / duration, 2),
+            }
+            print(f"\n{msg}\n")

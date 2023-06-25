@@ -1,7 +1,9 @@
 """
-A model worker executes the model based on Cacheflow.
+A model worker executes the model based on vLLM.
 
-Install Cacheflow first. Then, assuming controller is live:
+This is an experimental feature and will be documented soon. Please stay tuned!
+
+Install Cacheflow (the old code name for vLLM) first. Then, assuming the controller is live:
 1. ray start --head
 2. python3 -m fastchat.serve.cacheflow_worker --model-path path_to_vicuna
 
@@ -127,7 +129,8 @@ class CacheFlowWorker:
         logger.info(
             f"Send heart beat. Models: {[self.model_name]}. "
             f"Semaphore: {pretty_print_semaphore(model_semaphore)}. "
-            f"global_counter: {global_counter}"
+            f"global_counter: {global_counter}. "
+            f"worker_id: {worker_id}. "
         )
 
         url = self.controller_addr + "/receive_heart_beat"

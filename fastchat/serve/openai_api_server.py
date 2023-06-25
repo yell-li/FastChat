@@ -28,7 +28,12 @@ import shortuuid
 import tiktoken
 import uvicorn
 
-from fastchat.constants import WORKER_API_TIMEOUT, WORKER_API_EMBEDDING_BATCH_SIZE, ErrorCode
+from fastchat.constants import (
+    WORKER_API_TIMEOUT,
+    WORKER_API_EMBEDDING_BATCH_SIZE,
+    ErrorCode,
+)
+from fastchat.conversation import Conversation, SeparatorStyle
 from fastchat.model.model_adapter import get_conversation_template
 from fastapi.exceptions import RequestValidationError
 from fastchat.protocol.openai_api_protocol import (
@@ -57,10 +62,12 @@ from fastchat.protocol.api_protocol import (
     APIChatCompletionRequest,
     APITokenCheckRequest,
     APITokenCheckResponse,
-    APITokenCheckResponseItem
+    APITokenCheckResponseItem,
 )
 
 logger = logging.getLogger(__name__)
+
+conv_template_map = {}
 
 
 class AppSettings(BaseSettings):
@@ -82,13 +89,13 @@ async def check_api_key(
     if app_settings.api_keys:
         if auth is None or (token := auth.credentials) not in app_settings.api_keys:
             raise HTTPException(
-                status_code = 401,
-                detail = {
+                status_code=401,
+                detail={
                     "error": {
                         "message": "",
                         "type": "invalid_request_error",
                         "param": None,
-                        "code": "invalid_api_key"
+                        "code": "invalid_api_key",
                     }
                 },
             )
@@ -215,7 +222,7 @@ def process_input(model_name, input):
     return input
 
 
-def get_gen_params(
+async def get_gen_params(
     model_name: str,
     messages: Union[str, List[Dict[str, str]]],
     *,
@@ -226,7 +233,19 @@ def get_gen_params(
     stream: Optional[bool],
     stop: Optional[Union[str, List[str]]],
 ) -> Dict[str, Any]:
-    conv = get_conversation_template(model_name)
+    conv = await get_conv(model_name)
+    conv = Conversation(
+        name=conv["name"],
+        system=conv["system"],
+        roles=conv["roles"],
+        messages=list(conv["messages"]),  # prevent in-place modification
+        offset=conv["offset"],
+        sep_style=SeparatorStyle(conv["sep_style"]),
+        sep=conv["sep"],
+        sep2=conv["sep2"],
+        stop_str=conv["stop_str"],
+        stop_token_ids=conv["stop_token_ids"],
+    )
 
     if isinstance(messages, str):
         prompt = messages
@@ -264,7 +283,7 @@ def get_gen_params(
         "stream": stream,
     }
 
-    if stop is None:
+    if not stop:
         gen_params.update(
             {"stop": conv.stop_str, "stop_token_ids": conv.stop_token_ids}
         )
@@ -298,6 +317,23 @@ async def _get_worker_address(model_name: str, client: httpx.AsyncClient) -> str
     return worker_addr
 
 
+async def get_conv(model_name: str):
+    controller_address = app_settings.controller_address
+    async with httpx.AsyncClient() as client:
+        worker_addr = await _get_worker_address(model_name, client)
+        conv_template = conv_template_map.get((worker_addr, model_name))
+        if conv_template is None:
+            response = await client.post(
+                worker_addr + "/worker_get_conv_template",
+                headers=headers,
+                json={},
+                timeout=WORKER_API_TIMEOUT,
+            )
+            conv_template = response.json()["conv"]
+            conv_template_map[(worker_addr, model_name)] = conv_template
+        return conv_template
+
+
 @app.get("/v1/models", dependencies=[Depends(check_api_key)])
 async def show_available_models():
     controller_address = app_settings.controller_address
@@ -323,7 +359,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
     if error_check_ret is not None:
         return error_check_ret
 
-    gen_params = get_gen_params(
+    gen_params = await get_gen_params(
         request.model,
         request.messages,
         temperature=request.temperature,
@@ -495,7 +531,7 @@ async def create_completion(request: CompletionRequest):
     else:
         text_completions = []
         for text in request.prompt:
-            payload = get_gen_params(
+            payload = await get_gen_params(
                 request.model,
                 text,
                 temperature=request.temperature,
@@ -543,7 +579,7 @@ async def generate_completion_stream_generator(request: CompletionRequest, n: in
     for text in request.prompt:
         for i in range(n):
             previous_text = ""
-            payload = get_gen_params(
+            payload = await get_gen_params(
                 request.model,
                 text,
                 temperature=request.temperature,
@@ -647,6 +683,8 @@ async def create_embeddings(request: EmbeddingsRequest, model_name: str = None):
             "input": batch,
         }
         embedding = await get_embedding(payload)
+        if "error_code" in embedding and embedding["error_code"] != 0:
+            return create_error_response(embedding["error_code"], embedding["text"])
         data += [
             {
                 "object": "embedding",
@@ -685,6 +723,7 @@ async def get_embedding(payload: Dict[str, Any]):
 
 ### GENERAL API - NOT OPENAI COMPATIBLE ###
 
+
 @app.post("/api/v1/token_check")
 async def count_tokens(request: APITokenCheckRequest):
     """
@@ -718,13 +757,12 @@ async def count_tokens(request: APITokenCheckRequest):
 
             checkedList.append(
                 APITokenCheckResponseItem(
-                    fits=can_fit,
-                    contextLength=context_len,
-                    tokenCount=token_num
+                    fits=can_fit, contextLength=context_len, tokenCount=token_num
                 )
             )
 
     return APITokenCheckResponse(prompts=checkedList)
+
 
 @app.post("/api/v1/chat/completions")
 async def create_chat_completion(request: APIChatCompletionRequest):
@@ -815,7 +853,9 @@ if __name__ == "__main__":
         "--allowed-headers", type=json.loads, default=["*"], help="allowed headers"
     )
     parser.add_argument(
-        "--api-keys", type=lambda s: s.split(','), help="Optional list of comma separated API keys"
+        "--api-keys",
+        type=lambda s: s.split(","),
+        help="Optional list of comma separated API keys",
     )
     args = parser.parse_args()
 
